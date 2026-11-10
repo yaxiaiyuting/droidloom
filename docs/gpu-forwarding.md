@@ -147,7 +147,10 @@ expects.
   that renders on the same GPU takes the GPU's modifiers, and window buffers
   lie in VRAM. A compositor on another GPU takes none of them, the list is
   LINEAR alone, and buffers stay in system memory. The start-up line says
-  which. `--all-layouts` skips the question, for tests without a window.
+  which. `--all-layouts` skips the question, for tests without a window. The
+  presenter side of the same choice — which modifier a window target is
+  allocated and reported with — is in
+  [KNOWN_ISSUES.md](KNOWN_ISSUES.md#nvidia--kwin).
 - **Video buffers.** Decoders fill YUV AHardwareBuffers: NV12, YV12 and
   P010. The driver reports them as external formats, which ANGLE samples
   through a YCbCr conversion; a named format would also have to be

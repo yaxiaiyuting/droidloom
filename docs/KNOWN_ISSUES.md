@@ -556,6 +556,47 @@ The subsequent source fixes and full-suite results are recorded above.
   goodbye that Composer acknowledges and ends quietly, so a close without one
   still reports a real failure. Needs an Android rebuild.
 
+### NVIDIA + KWin
+
+- **The render node and the GBM backend both have to match the GPU.** With
+  several GPUs, `DROIDLOOM_RENDER_NODE` must name the NVIDIA render node
+  (`/dev/dri/renderD128` when the iGPU is 129), and `GBM_BACKEND` must not be
+  set: a value such as `dri` makes Mesa's libgbm pick a backend that cannot
+  allocate on that node, so every target allocation fails even though the node
+  and the driver are fine. The presenter logs the render node, its sysfs
+  driver, the selected GBM backend, the raw `GBM_BACKEND` value and the target
+  modifiers, which separates the two cases.
+- **The target layout is chosen by allocating, not from the feedback table.**
+  KWin advertises only block-linear modifiers for `ARGB8888` and `XRGB8888`,
+  never a linear one, while libgbm's nvidia backend can allocate those layouts.
+  The presenter tries the advertised modifiers, then a modifier-less
+  allocation, then linear. Android may only receive a modifier that the host
+  Vulkan list contains, so compressed (`COMPRESSION=1`) layouts are refused
+  before use; a modifier the GPU server cannot look up aborts it, not just the
+  app. `DROIDLOOM_TARGET_POLICY`, `DROIDLOOM_ALLOC_MODIFIER` and
+  `DROIDLOOM_WIRE_MODIFIER` override the chain and the reported values.
+- **The wheel arrives as a touch drag.** The input bridge between the presenter
+  and Android carries touch contacts and key transitions only, and
+  InputFlinger's injector builds a touchscreen motion event from them, so a
+  `wl_pointer` axis sample cannot be forwarded as a wheel. Each notch becomes a
+  short vertical drag at the cursor, sixty logical pixels of travel, merged
+  from the several axis events one notch produces. `DROIDLOOM_WHEEL=touchpad`
+  is the default and also accepts finger and continuous scrolling; `touch`
+  restricts itself to real wheel sources, and `off` forwards nothing.
+  Two details decide whether Android actually scrolls:
+  the synthetic contact must last long enough for the app to derive a gesture
+  velocity (the four samples are spread over 12–60 ms, not sent on one
+  timestamp), and a trackpad delivers a stream of small `axis` deltas instead of
+  a 120-unit notch, so `DROIDLOOM_WHEEL=touchpad` accumulates them into whole
+  notches (15 axis units each) before dragging.
+  `DROIDLOOM_WHEEL_DEBUG=1` prints every axis frame that reaches the surface,
+  which is how to tell "the event never arrived" from "the app ignored it".
+- **The toplevel needs a titlebar.** The presenter requests server-side
+  decorations, so a compositor that implements `zxdg-decoration` draws the
+  titlebar and the window can be dragged by it. A compositor without the
+  protocol shows the window undecorated, and moving it is then up to the
+  compositor's own window actions.
+
 ## Performance review targets
 
 These findings describe the current source, including working-tree changes;
