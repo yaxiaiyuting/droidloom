@@ -332,7 +332,10 @@ struct App {
     text_input: text_input::TextInput,
     registry_state: RegistryState,
     output_state: OutputState,
-    output_power_manager: ZwlrOutputPowerManagerV1,
+    // KWin and other compositors do not implement wlroots'
+    // zwlr-output-power-manager-v1. Missing it only disables pausing on display
+    // power state, which must not stop the presenter from starting.
+    output_power_manager: Option<ZwlrOutputPowerManagerV1>,
     output_power: Vec<OutputPowerState>,
     idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
     host_display_powered: Option<bool>,
@@ -2412,10 +2415,11 @@ impl OutputHandler for App {
     ) {
         let control = self
             .output_power_manager
-            .get_output_power(&output, qh, output.clone());
+            .as_ref()
+            .map(|manager| manager.get_output_power(&output, qh, output.clone()));
         self.output_power.push(OutputPowerState {
             output,
-            control: Some(control),
+            control,
             powered: None,
         });
         if let Err(error) = self
@@ -3322,7 +3326,7 @@ fn run() -> Result<(), PresenterError> {
         return Err(PresenterError::DmabufV4Required);
     }
     let sync_manager: WpLinuxDrmSyncobjManagerV1 = globals.bind(&qh, 1..=1, ())?;
-    let output_power_manager: ZwlrOutputPowerManagerV1 = globals.bind(&qh, 1..=1, ())?;
+    let output_power_manager: Option<ZwlrOutputPowerManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
     let mut app = App {
         activation: activation::Activation::new(&globals, &qh, host_grants),
         layer_globals: layers::Globals {
