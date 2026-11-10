@@ -19,6 +19,7 @@ mod readiness;
 mod resize;
 mod text_input;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -30,6 +31,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use drm_fourcc::DrmFourcc;
@@ -44,7 +46,7 @@ use droidloom_denial_protocol::{
 };
 use droidloom_syncobj::{SyncobjDevice, WaylandTimeline};
 use droidloom_window_policy::{LogicalSize, SessionMode, WindowPolicyPaths, WindowPolicyStore};
-use gbm::{BufferObject, Device as GbmDevice, Modifier};
+use gbm::{BufferObject, BufferObjectFlags, Device as GbmDevice, Modifier};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -134,7 +136,7 @@ enum PresenterError {
     Gbm(String),
     #[error("the compositor does not advertise linux-dmabuf v4 feedback")]
     DmabufV4Required,
-    #[error("the compositor exposes no linear ARGB8888 or XRGB8888 DMA-BUF format")]
+    #[error("the compositor exposes no ARGB8888 or XRGB8888 DMA-BUF format")]
     NoRenderFormat,
     #[error("task {0:?} does not exist")]
     UnknownTask(TaskObjectId),
@@ -147,8 +149,550 @@ enum PresenterError {
     Configuration(&'static str),
 }
 
+/// How host composition targets choose the layout they hand to Android and `KWin`.
+///
+/// One target buffer must satisfy three parties at once: host libgbm allocates it,
+/// Android's gralloc importer writes into it, and the compositor imports it as a
+/// DMA-BUF. Those three disagree about modifiers on some driver stacks (NVIDIA on
+/// Mesa allocates tiled layouts that `KWin` advertises but libgbm refuses), so the
+/// layout is a runtime choice instead of a compile-time assumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetPolicy {
+    /// Walk the fallback chain until one rung allocates.
+    Auto,
+    /// Allocate an explicitly linear buffer and report `MOD_LINEAR`.
+    Linear,
+    /// Allocate without a modifier and report `DRM_FORMAT_MOD_INVALID`.
+    Invalid,
+    /// Allocate with every modifier the compositor advertised.
+    Advertised,
+}
+
+impl TargetPolicy {
+    fn from_environment() -> Result<Self, PresenterError> {
+        const INVALID: PresenterError = PresenterError::Configuration(
+            "DROIDLOOM_TARGET_POLICY must be auto, linear, invalid or advertised",
+        );
+        match env::var("DROIDLOOM_TARGET_POLICY") {
+            Err(env::VarError::NotPresent) => Ok(Self::Auto),
+            Ok(value) => match value.as_str() {
+                "auto" => Ok(Self::Auto),
+                "linear" => Ok(Self::Linear),
+                "invalid" => Ok(Self::Invalid),
+                "advertised" => Ok(Self::Advertised),
+                _ => Err(INVALID),
+            },
+            Err(env::VarError::NotUnicode(_)) => Err(INVALID),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Linear => "linear",
+            Self::Invalid => "invalid",
+            Self::Advertised => "advertised",
+        }
+    }
+
+    /// The ordered rungs of this policy for one format's advertised modifiers.
+    ///
+    /// `Auto` is a try-allocate chain, not a static preference: every rung is really
+    /// handed to libgbm and the first one that allocates wins. The order reflects
+    /// what the two render nodes can actually do on this machine (measured):
+    /// `renderD128` (NVIDIA) allocates every advertised `NVIDIA_BLOCK_LINEAR_2D`
+    /// modifier and `LINEAR`, while `renderD129` (AMD) allocates `LINEAR` and a
+    /// modifier-less buffer but no NVIDIA modifier. Asking for an advertised layout
+    /// first therefore keeps the cross-GPU-safe behaviour where it works, and the
+    /// modifier-less rung is the last resort that works on both.
+    fn attempts(self, advertised: &[Modifier]) -> Vec<TargetAttempt> {
+        let render = BufferObjectFlags::RENDERING;
+        let advertised_rungs = TargetAttempt::advertised(advertised);
+        match self {
+            Self::Auto => {
+                let linear_advertised = advertised.contains(&Modifier::Linear);
+                let mut chain = Vec::with_capacity(4 + advertised_rungs.len());
+                // Linear first when the compositor advertises it: host Mesa and
+                // Android Mesa agree on that layout across GPUs.
+                if linear_advertised {
+                    chain.push(TargetAttempt::linear("linear-advertised"));
+                }
+                chain.extend(
+                    advertised_rungs
+                        .into_iter()
+                        .filter(|rung| rung.request != AllocRequest::Modifier(Modifier::Linear)),
+                );
+                // Modifier-less allocation: the driver may backfill a layout both
+                // consumers accept. Radeonsi backfills MOD_INVALID here, which the
+                // Android side cannot take, so this rung only helps on drivers that
+                // answer with a real layout.
+                chain.push(TargetAttempt::modifierless("gbm-default", render));
+                // Last resort: linear, which radeonsi allocates and KWin composites
+                // even though it does not advertise it for ARGB/XRGB8888.
+                if !linear_advertised {
+                    chain.push(TargetAttempt::linear("linear-fallback"));
+                }
+                chain
+            }
+            Self::Linear => vec![TargetAttempt::linear("linear-forced")],
+            Self::Invalid => vec![TargetAttempt::modifierless_invalid("gbm-default", render)],
+            Self::Advertised => advertised_rungs,
+        }
+    }
+}
+
+/// `DROIDLOOM_ALLOC_MODIFIER`: what the presenter asks libgbm for, replacing the
+/// allocation half of `DROIDLOOM_TARGET_POLICY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AllocModifierOverride {
+    /// `none`: `gbm_bo_create`, the driver picks the layout.
+    None,
+    /// `linear`: `gbm_bo_create_with_modifiers` with `MOD_LINEAR`.
+    Linear,
+    /// `advertised`: one rung per compositor-advertised modifier.
+    Advertised,
+    /// A raw DRM modifier value: `0x…` hex or plain decimal.
+    Value(Modifier),
+}
+
+/// `DROIDLOOM_WIRE_MODIFIER`: the modifier handed to the compositor for
+/// `wl_buffer` import, independent of the value Android receives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireModifierOverride {
+    /// `linear`: `MOD_LINEAR`.
+    Linear,
+    /// `invalid`: `DRM_FORMAT_MOD_INVALID`.
+    Invalid,
+    /// A raw DRM modifier value: `0x…` hex or plain decimal.
+    Value(Modifier),
+}
+
+impl WireModifierOverride {
+    fn wire(self) -> WireModifier {
+        match self {
+            Self::Linear => WireModifier::Fixed(Modifier::Linear),
+            Self::Invalid => WireModifier::Fixed(Modifier::Invalid),
+            Self::Value(modifier) => WireModifier::Fixed(modifier),
+        }
+    }
+}
+
+/// Parse a DRM modifier written as `0x…` hex or plain decimal.
+fn parse_modifier_value(text: &str) -> Option<Modifier> {
+    let (digits, radix) = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .map_or((text, 10), |hex| (hex, 16));
+    u64::from_str_radix(digits, radix)
+        .ok()
+        .map(Modifier::from)
+}
+
+/// The full target layout decision: one policy plus two independent overrides.
+///
+/// The policy is the everyday knob. The overrides exist because finding out which
+/// of the three consumers rejects a buffer needs allocation and reporting to move
+/// separately: a layout can be allocatable on one render node while the compositor
+/// only accepts a different value on the wire.
+/// 读 `~/.config/droidloom/titles.conf`。格式：每行 `包名=显示名`，`#` 开头是注释。
+fn load_window_titles() -> std::collections::HashMap<String, String> {
+    let path = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")))
+        .map(|base| base.join("droidloom/titles.conf"));
+    let mut map = std::collections::HashMap::new();
+    let Some(path) = path else { return map };
+    let Ok(text) = std::fs::read_to_string(&path) else { return map };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some((package, title)) = line.split_once('=') {
+            let package = package.trim();
+            let title = title.trim();
+            if !package.is_empty() && !title.is_empty() {
+                map.insert(package.to_owned(), title.to_owned());
+            }
+        }
+    }
+    map
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TargetConfig {
+    policy: TargetPolicy,
+    alloc: Option<AllocModifierOverride>,
+    wire: Option<WireModifierOverride>,
+}
+
+impl TargetConfig {
+    fn from_environment() -> Result<Self, PresenterError> {
+        const ALLOC_INVALID: PresenterError = PresenterError::Configuration(
+            "DROIDLOOM_ALLOC_MODIFIER must be auto, none, linear, advertised or a modifier value",
+        );
+        const WIRE_INVALID: PresenterError = PresenterError::Configuration(
+            "DROIDLOOM_WIRE_MODIFIER must be auto, actual, linear, invalid or a modifier value",
+        );
+        let policy = TargetPolicy::from_environment()?;
+        let alloc = match env::var("DROIDLOOM_ALLOC_MODIFIER") {
+            Err(env::VarError::NotPresent) => None,
+            Ok(value) => match value.as_str() {
+                // "auto" is the documented default, so it must behave like unset.
+                "auto" => None,
+                "none" => Some(AllocModifierOverride::None),
+                "linear" => Some(AllocModifierOverride::Linear),
+                "advertised" => Some(AllocModifierOverride::Advertised),
+                other => Some(AllocModifierOverride::Value(
+                    parse_modifier_value(other).ok_or(ALLOC_INVALID)?,
+                )),
+            },
+            Err(env::VarError::NotUnicode(_)) => return Err(ALLOC_INVALID),
+        };
+        let wire = match env::var("DROIDLOOM_WIRE_MODIFIER") {
+            Err(env::VarError::NotPresent) => None,
+            Ok(value) => match value.as_str() {
+                // "actual" (and its "auto" alias) means "report what gbm produced",
+                // which is also what an unset variable does.
+                "auto" | "actual" => None,
+                "linear" => Some(WireModifierOverride::Linear),
+                "invalid" => Some(WireModifierOverride::Invalid),
+                other => Some(WireModifierOverride::Value(
+                    parse_modifier_value(other).ok_or(WIRE_INVALID)?,
+                )),
+            },
+            Err(env::VarError::NotUnicode(_)) => return Err(WIRE_INVALID),
+        };
+        Ok(Self {
+            policy,
+            alloc,
+            wire,
+        })
+    }
+
+    /// `policy=auto alloc=none wire=invalid`, for the startup log.
+    fn describe(self) -> String {
+        let alloc = match self.alloc {
+            None => "auto".to_owned(),
+            Some(AllocModifierOverride::None) => "none".to_owned(),
+            Some(AllocModifierOverride::Linear) => "linear".to_owned(),
+            Some(AllocModifierOverride::Advertised) => "advertised".to_owned(),
+            Some(AllocModifierOverride::Value(modifier)) => describe_modifier(modifier),
+        };
+        let wire = match self.wire {
+            None => "actual".to_owned(),
+            Some(WireModifierOverride::Linear) => "linear".to_owned(),
+            Some(WireModifierOverride::Invalid) => "invalid".to_owned(),
+            Some(WireModifierOverride::Value(modifier)) => describe_modifier(modifier),
+        };
+        format!(
+            "policy={} alloc={} wire={}",
+            self.policy.label(),
+            alloc,
+            wire
+        )
+    }
+
+    /// The ordered rungs to try, with any operator override applied on top.
+    fn attempts(self, advertised: &[Modifier]) -> Vec<TargetAttempt> {
+        let mut chain = match self.alloc {
+            None => self.policy.attempts(advertised),
+            Some(AllocModifierOverride::None) => vec![TargetAttempt::modifierless(
+                "alloc-none",
+                BufferObjectFlags::RENDERING,
+            )],
+            Some(AllocModifierOverride::Linear) => vec![TargetAttempt::linear("alloc-linear")],
+            Some(AllocModifierOverride::Advertised) => TargetAttempt::advertised(advertised),
+            Some(AllocModifierOverride::Value(modifier)) => vec![TargetAttempt {
+                rung: "alloc-modifier",
+                request: AllocRequest::Modifier(modifier),
+                wire: WireModifier::Actual,
+            }],
+        };
+        if let Some(wire) = self.wire {
+            let wire = wire.wire();
+            for attempt in &mut chain {
+                // An operator-chosen wire value is final, even when gbm disagrees.
+                attempt.wire = wire;
+            }
+        }
+        chain
+    }
+
+    /// The wire modifier to announce before any allocation has proven one.
+    ///
+    /// Only a fallback: the startup probe replaces it with what libgbm really
+    /// allocated, which is the value Android should allocate against.
+    fn predicted_android_modifier(advertised: &[Modifier]) -> Modifier {
+        if advertised.contains(&Modifier::Linear) {
+            return Modifier::Linear;
+        }
+        // Before the probe runs, name the layout the chain tries first. Anything
+        // Android cannot look up (`MOD_INVALID`) is never a legal answer here.
+        advertised
+            .iter()
+            .copied()
+            .filter(|modifier| android_accepts_modifier(*modifier))
+            .min_by_key(|modifier| candidate_rank(*modifier))
+            .unwrap_or(Modifier::Linear)
+    }
+}
+
+/// One rung of the target allocation fallback chain.
+#[derive(Clone, Copy, Debug)]
+struct TargetAttempt {
+    rung: &'static str,
+    request: AllocRequest,
+    wire: WireModifier,
+}
+
+impl TargetAttempt {
+    /// `gbm_bo_create`: the driver picks, so the wire value can only be whatever
+    /// gbm backfills — `MOD_INVALID` on radeonsi, an implicit layout elsewhere.
+    fn modifierless(rung: &'static str, usage: BufferObjectFlags) -> Self {
+        Self {
+            rung,
+            request: AllocRequest::Unspecified(usage),
+            wire: WireModifier::Actual,
+        }
+    }
+
+    /// `gbm_bo_create` with `MOD_INVALID` on the wire, whatever gbm backfills.
+    fn modifierless_invalid(rung: &'static str, usage: BufferObjectFlags) -> Self {
+        Self {
+            rung,
+            request: AllocRequest::Unspecified(usage),
+            wire: WireModifier::Fixed(Modifier::Invalid),
+        }
+    }
+
+    /// One explicit linear allocation, reported as linear.
+    ///
+    /// `KWin` composites a linear buffer even though it does not advertise linear
+    /// for ARGB/XRGB8888, and `0` is the one modifier Android always accepts. The
+    /// host GL stack cannot render into an NVIDIA linear DMA-BUF though, so this
+    /// stays a fallback rather than the default.
+    fn linear(rung: &'static str) -> Self {
+        Self {
+            rung,
+            request: AllocRequest::Modifier(Modifier::Linear),
+            wire: WireModifier::Fixed(Modifier::Linear),
+        }
+    }
+
+    /// One rung per advertised modifier, likeliest first, each reporting what
+    /// gbm returned.
+    fn advertised(advertised: &[Modifier]) -> Vec<Self> {
+        let mut ranked = advertised
+            .iter()
+            .copied()
+            .filter(|modifier| android_accepts_modifier(*modifier))
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by_key(|modifier| candidate_rank(*modifier));
+        ranked
+            .into_iter()
+            .map(|modifier| Self {
+                rung: "advertised",
+                request: AllocRequest::Modifier(modifier),
+                wire: WireModifier::Actual,
+            })
+            .collect()
+    }
+
+    /// `alloc=0x…` for the attempt log: the value actually requested.
+    fn describe_alloc(&self) -> String {
+        describe_alloc_request(self.request)
+    }
+}
+
+/// What a rung asks libgbm for, in the same terms the log uses.
+fn describe_alloc_request(request: AllocRequest) -> String {
+    match request {
+        AllocRequest::Unspecified(usage) => format!("none(usage={usage:?})"),
+        AllocRequest::Modifier(modifier) => describe_modifier(modifier),
+    }
+}
+
+/// What a rung asks libgbm for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AllocRequest {
+    /// `gbm_bo_create`: no modifier is requested, the driver picks the layout.
+    Unspecified(BufferObjectFlags),
+    /// `gbm_bo_create_with_modifiers` with exactly one candidate.
+    Modifier(Modifier),
+}
+
+/// What `create_wayland_buffer` tells `KWin` about the buffer.
+///
+/// This is deliberately not always `allocation.modifier()`: a modifier-less
+/// allocation produces a layout the compositor never advertised, and the only
+/// honest way to present that is `DRM_FORMAT_MOD_INVALID` ("no assumption").
+/// Android's metadata carries the allocation's real layout instead, because its
+/// compositor aborts on a modifier it cannot look up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireModifier {
+    /// Report this value even when the allocation itself disagrees.
+    Fixed(Modifier),
+    /// Report whatever gbm reports: only correct when the rung requested exactly
+    /// one advertised modifier.
+    Actual,
+}
+
+/// Everything one rung needs to allocate a target.
+struct TargetRequest<'a> {
+    id: BufferId,
+    width: u32,
+    height: u32,
+    fourcc: DrmFourcc,
+    advertised: &'a [Modifier],
+}
+
+/// The layout a successful rung produced, for the one-time diagnostic line.
+struct TargetLayout {
+    rung: &'static str,
+    request: AllocRequest,
+    alloc_modifier: Modifier,
+    wire_modifier: Modifier,
+    width: u32,
+    height: u32,
+    fourcc: DrmFourcc,
+    planes: u32,
+}
+
+/// A short name for a modifier: the layout it means, or its value.
+///
+/// gbm's enum names for the NVIDIA layouts repeat the value and say nothing about
+/// the parameters, which is what the log needs to be read: KIND and HEIGHT decide
+/// whether Android can take the buffer at all.
+fn describe_modifier(modifier: Modifier) -> String {
+    let raw = u64::from(modifier);
+    if modifier == Modifier::Linear {
+        return format!("0x{raw:016x} (LINEAR)");
+    }
+    if modifier == Modifier::Invalid {
+        return format!("0x{raw:016x} (MOD_INVALID)");
+    }
+    if let Some(height) = ANDROID_NVIDIA_LAYOUTS
+        .iter()
+        .position(|allowed| *allowed == raw)
+    {
+        return format!("0x{raw:016x} (NVIDIA_BLOCK_LINEAR_2D KIND=6 HEIGHT={height})");
+    }
+    format!("0x{raw:016x}")
+}
+
+/// The modifier `wl_buffer` import carries for one rung.
+///
+/// Android always receives the allocation's own layout; the compositor gets the
+/// same value when it advertised it, `MOD_INVALID` when it did not (the implicit
+/// import KWin accepts), or whatever an override forced.
+fn compositor_modifier_for(
+    attempt: &TargetAttempt,
+    alloc_modifier: Modifier,
+    advertised: &[Modifier],
+) -> Modifier {
+    match attempt.wire {
+        WireModifier::Actual if advertised.contains(&alloc_modifier) => alloc_modifier,
+        WireModifier::Actual => Modifier::Invalid,
+        WireModifier::Fixed(fixed) => fixed,
+    }
+}
+
+/// The modifiers a target produced, with a shared value printed once.
+///
+/// Android always sees the allocation's own layout, so only the split case where
+/// the compositor was told something else needs two values.
+fn describe_target_modifiers(layout: &TargetLayout) -> String {
+    let alloc = describe_modifier(layout.alloc_modifier);
+    if layout.alloc_modifier == layout.wire_modifier {
+        format!("modifier={alloc}")
+    } else {
+        format!(
+            "modifier={alloc} compositor={}",
+            describe_modifier(layout.wire_modifier)
+        )
+    }
+}
+
+/// The NVIDIA layouts the host Vulkan lists for a shared buffer.
+///
+/// `vkGetPhysicalDeviceFormatProperties2` answers with exactly these six
+/// block-linear layouts (`KIND=6`, `COMPRESSION=0`, `SECTOR_LAYOUT=1`, HEIGHT 0..5)
+/// plus linear. Anything else the compositor advertises — notably the compressed
+/// `KIND=8` family — is allocatable by libgbm but absent from that list, and
+/// Android's `AHardwareBuffer` path aborts the whole GPU server on a modifier it
+/// cannot find. This whitelist is therefore the only reliable guard.
+const ANDROID_NVIDIA_LAYOUTS: [u64; 6] = [
+    0x0300_0000_0060_6010,
+    0x0300_0000_0060_6011,
+    0x0300_0000_0060_6012,
+    0x0300_0000_0060_6013,
+    0x0300_0000_0060_6014,
+    0x0300_0000_0060_6015,
+];
+
+/// Whether Android can take this modifier in `BufferMetadata`.
+///
+/// Linear is the one layout every render node can produce; the rest must be in the
+/// host Vulkan list. `MOD_INVALID` and every other value would abort the GPU
+/// server, so they are refused here before any candidate is tried.
+fn android_accepts_modifier(modifier: Modifier) -> bool {
+    let raw = u64::from(modifier);
+    modifier == Modifier::Linear || ANDROID_NVIDIA_LAYOUTS.contains(&raw)
+}
+
+/// Candidate order for advertised modifiers, most likely to work first.
+///
+/// The six `KIND=6` layouts come first, smallest height first, because they are
+/// what the host Vulkan advertises as renderable; anything else is kept behind
+/// them only so the attempt log names what the compositor offered.
+fn candidate_rank(modifier: Modifier) -> (u8, u64) {
+    let raw = u64::from(modifier);
+    if ANDROID_NVIDIA_LAYOUTS.contains(&raw) {
+        (0, raw)
+    } else {
+        (1, raw)
+    }
+}
+
+/// Describe a libgbm allocation failure.
+///
+/// gbm reports failure by returning NULL and does not necessarily set errno, so a
+/// mapped errno is often left over from an earlier call. Say so instead of
+/// presenting it as the cause.
+fn gbm_allocation_error(error: io::Error) -> PresenterError {
+    PresenterError::Gbm(format!(
+        "allocation returned NULL (errno {error}, which libgbm may not have set)"
+    ))
+}
+
+/// Take one DMA-BUF descriptor and its layout per plane of a gbm allocation.
+fn collect_planes(
+    allocation: &BufferObject<()>,
+    plane_count: u32,
+) -> Result<(Vec<OwnedFd>, Vec<PlaneMetadata>), PresenterError> {
+    let mut planes = Vec::with_capacity(plane_count as usize);
+    let mut plane_metadata = Vec::with_capacity(plane_count as usize);
+    for index in 0..plane_count {
+        let plane =
+            i32::try_from(index).map_err(|_| PresenterError::Configuration("plane index overflow"))?;
+        planes.push(
+            allocation
+                .fd_for_plane(plane)
+                .map_err(|error| PresenterError::Gbm(error.to_string()))?,
+        );
+        plane_metadata.push(PlaneMetadata {
+            index,
+            offset: allocation.offset(plane),
+            stride: allocation.stride_for_plane(plane),
+        });
+    }
+    Ok((planes, plane_metadata))
+}
+
 struct RenderTarget {
+    /// Android's view of the buffer; its modifier is never `MOD_INVALID`.
     metadata: BufferMetadata,
+    /// `KWin`'s view: the allocation's layout when advertised, else `MOD_INVALID`.
+    compositor_modifier: Modifier,
     planes: Vec<OwnedFd>,
     wayland: Option<wl_buffer::WlBuffer>,
     sync: Option<BufferSync>,
@@ -238,6 +782,8 @@ struct TaskWindow {
     applied_scale_120: u32,
     resize: resize::Pending,
     configure_serial: u32,
+    /// Generation of the format feedback last sent for this task.
+    feedback_generation: u32,
     refresh_millihz: u32,
     entered_outputs: Vec<wl_output::WlOutput>,
     presentation_output: Option<wl_output::WlOutput>,
@@ -322,6 +868,10 @@ struct App {
     layer_globals: layers::Globals,
     clipboard: clipboard::Clipboard,
     clipboard_inputs: VecDeque<(TaskObjectId, InputEvent, u64)>,
+    /// 包名 → 窗口标题。来自 `~/.config/droidloom/titles.conf`（`pkg=显示名` 一行一条）。
+    /// Android 的 app label 在宿主侧拿不到（要多打一次应用目录的往返），
+    /// 所以用一个可编辑的小映射：缺省回落包名，行为与原来一致。
+    window_titles: std::collections::HashMap<String, String>,
     text_input: text_input::TextInput,
     registry_state: RegistryState,
     output_state: OutputState,
@@ -348,6 +898,18 @@ struct App {
     sync_manager: WpLinuxDrmSyncobjManagerV1,
     syncobj: SyncobjDevice,
     gbm: GbmDevice<File>,
+    target_config: TargetConfig,
+    /// The (fourcc, wire modifier) the last successful allocation settled on.
+    chosen_target: Cell<Option<(DrmFourcc, Modifier)>>,
+    /// The last successful attempt line, so a three-buffer pool reports it once.
+    target_attempt_log: Cell<Option<(u32, u32, DrmFourcc, &'static str)>>,
+    /// The last failed attempt line, for the same reason.
+    target_failure_log: Cell<Option<(u32, u32, DrmFourcc, &'static str)>>,
+    /// Android must be told again after the chosen target layout changed.
+    formats_stale: Cell<bool>,
+    render_node: PathBuf,
+    /// The selected target layout is reported once per presenter run.
+    target_layout_logged: AtomicBool,
     listener: DenialEndpointListener,
     window_policy: WindowPolicyStore,
     /// The density each task gets on the output it is on.
@@ -701,6 +1263,11 @@ impl App {
         )
     }
 
+    /// The first supported fourcc and every modifier the compositor advertises for it.
+    ///
+    /// Selection stays compositor-driven: `DROIDLOOM_TARGET_POLICY` decides how the
+    /// presenter allocates, not which formats exist. Linear sorts first, which is
+    /// the cross-GPU layout host Mesa and Android Mesa agree on.
     fn selected_format(&self) -> Result<(DrmFourcc, Vec<Modifier>), PresenterError> {
         let feedback = self
             .feedback
@@ -712,13 +1279,7 @@ impl App {
                 .iter()
                 .flat_map(|tranche| tranche.formats.iter())
                 .filter_map(|index| feedback.format_table().get(*index as usize))
-                // Host Mesa and Android Mesa can disagree about compressed or
-                // tiled layouts even when Wayland advertises them. Linear
-                // DMA-BUFs keep the shared render targets importable across
-                // that boundary, including laptops with multiple GPUs.
-                .filter(|entry| {
-                    entry.format == fourcc as u32 && entry.modifier == u64::from(Modifier::Linear)
-                })
+                .filter(|entry| entry.format == fourcc as u32)
                 .map(|entry| Modifier::from(entry.modifier))
                 .collect::<Vec<_>>();
             modifiers.sort_unstable_by_key(|modifier| u64::from(*modifier));
@@ -730,15 +1291,26 @@ impl App {
         Err(PresenterError::NoRenderFormat)
     }
 
+    /// The (fourcc, modifier) pair Android may allocate targets with.
+    ///
+    /// This is the layout the presenter actually allocated, not the candidate list:
+    /// handing Android several options lets it pick a layout `KWin` then has to
+    /// reject. Until the startup probe has picked one, the policy prediction stands
+    /// in, and every later allocation republishes the value it settled on.
     fn published_formats(&self) -> Result<Vec<FormatModifier>, PresenterError> {
-        let (fourcc, modifiers) = self.selected_format()?;
-        Ok(modifiers
-            .into_iter()
-            .map(|modifier| FormatModifier {
-                fourcc: fourcc as u32,
-                modifier: u64::from(modifier),
-            })
-            .collect())
+        let (fourcc, advertised) = self.selected_format()?;
+        let modifier = self
+            .chosen_target
+            .get()
+            .filter(|(chosen, _)| *chosen == fourcc)
+            .map_or_else(
+                || TargetConfig::predicted_android_modifier(&advertised),
+                |(_, modifier)| modifier,
+            );
+        Ok(vec![FormatModifier {
+            fourcc: fourcc as u32,
+            modifier: u64::from(modifier),
+        }])
     }
 
     fn create_task(
@@ -762,7 +1334,12 @@ impl App {
             let window = self
                 .xdg_shell
                 .create_window(surface, WindowDecorations::None, qh);
-            window.set_title(package.to_owned());
+            let title = self
+                .window_titles
+                .get(package)
+                .cloned()
+                .unwrap_or_else(|| package.to_owned());
+            window.set_title(title);
             window.set_app_id(package.to_owned());
             window.set_min_size(Some((1, 1)));
             if let Some(manager) = &self.insets_manager {
@@ -806,6 +1383,7 @@ impl App {
                 applied_scale_120: FRACTIONAL_SCALE_DENOMINATOR,
                 resize: resize::Pending::new(FRACTIONAL_SCALE_DENOMINATOR),
                 configure_serial: 0,
+                feedback_generation: 1,
                 refresh_millihz: 60_000,
                 entered_outputs: Vec::new(),
                 presentation_output: None,
@@ -964,7 +1542,7 @@ impl App {
 
     fn ensure_render_targets(
         &mut self,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         object: TaskObjectId,
         serial: u32,
     ) -> Result<(), PresenterError> {
@@ -989,7 +1567,7 @@ impl App {
         let mut targets: Vec<RenderTarget> = Vec::with_capacity(TARGET_POOL_LENGTH);
         for _ in 0..TARGET_POOL_LENGTH {
             let id = self.allocate_buffer_id()?;
-            let target = self.allocate_target(qh, id, width, height)?;
+            let target = self.allocate_target(id, width, height)?;
             targets.push(target);
         }
         // Finish allocation before publishing any descriptors. A failed GBM
@@ -1032,74 +1610,289 @@ impl App {
         Ok(BufferId(self.next_buffer_id))
     }
 
+    /// Allocate one composition target through `DROIDLOOM_TARGET_POLICY`'s chain.
+    ///
+    /// A libgbm failure on one modifier says nothing about the next one, and every
+    /// buffer of the pool must use the same layout, so the chain is walked once per
+    /// allocation rather than once per configure. Exhausting it keeps the failure
+    /// fatal: without a target pool the task has nothing to render into.
     fn allocate_target(
         &self,
-        _qh: &QueueHandle<Self>,
         id: BufferId,
         width: u32,
         height: u32,
     ) -> Result<RenderTarget, PresenterError> {
-        let (fourcc, modifiers) = self.selected_format()?;
-        let allocation = self
-            .gbm
-            .create_buffer_object_with_modifiers::<()>(
-                width,
-                height,
-                fourcc,
-                modifiers.iter().copied(),
-            )
-            .map_err(|error| PresenterError::Gbm(error.to_string()))?;
+        let (fourcc, advertised) = self.selected_format()?;
+        let request = TargetRequest {
+            id,
+            width,
+            height,
+            fourcc,
+            advertised: &advertised,
+        };
+        let config = self.target_config;
+        let mut chain = config.attempts(&advertised);
+        // Android caches the layout it was told about, so the first successful
+        // choice is pinned: later allocations try that rung first, and a resize
+        // only re-selects when the pinned rung actually fails.
+        let pinned = self
+            .chosen_target
+            .get()
+            .filter(|(pinned_fourcc, _)| *pinned_fourcc == fourcc)
+            .and_then(|(_, modifier)| {
+                chain
+                    .iter()
+                    .position(|attempt| attempt.request == AllocRequest::Modifier(modifier))
+            });
+        if let Some(index) = pinned {
+            let attempt = chain.remove(index);
+            chain.insert(0, attempt);
+        }
+        if chain.is_empty() {
+            return Err(PresenterError::Gbm(format!(
+                "no target layout candidate for {fourcc}: every advertised modifier is missing from the host Vulkan list ({})",
+                config.describe()
+            )));
+        }
+        let mut failures = Vec::new();
+        for attempt in chain {
+            let alloc = attempt.describe_alloc();
+            match self.allocate_target_rung(&request, &attempt) {
+                Ok((target, layout)) => {
+                    // The pool allocates the same size three times; report the
+                    // selection once per size and rung rather than per buffer.
+                    let key = (width, height, fourcc, attempt.rung);
+                    if self.target_attempt_log.get() != Some(key) {
+                        eprintln!(
+                            "Droidloom target alloc attempt: size={width}x{height} fourcc={fourcc} rung={} alloc={alloc} result=ok {} planes={}",
+                            attempt.rung,
+                            describe_target_modifiers(&layout),
+                            layout.planes,
+                        );
+                        self.target_attempt_log.set(Some(key));
+                    }
+                    let previous = self.chosen_target.replace(Some((fourcc, layout.alloc_modifier)));
+                    if let Some((previous_fourcc, previous_modifier)) = previous
+                        && (previous_fourcc, previous_modifier) != (fourcc, layout.alloc_modifier)
+                    {
+                        eprintln!(
+                            "Droidloom target layout changed: fourcc {previous_fourcc}→{fourcc} modifier {}→{}; republishing the format feedback",
+                            describe_modifier(previous_modifier),
+                            describe_modifier(layout.alloc_modifier)
+                        );
+                        self.formats_stale.set(true);
+                    }
+                    self.report_target_layout(&layout);
+                    return Ok(target);
+                }
+                Err(error) => {
+                    let key = (width, height, fourcc, attempt.rung);
+                    if self.target_failure_log.get() != Some(key) {
+                        eprintln!(
+                            "Droidloom target alloc attempt: size={width}x{height} fourcc={fourcc} rung={} alloc={alloc} result=err({error})",
+                            attempt.rung,
+                        );
+                        self.target_failure_log.set(Some(key));
+                    }
+                    failures.push(format!("{}: {error}", attempt.rung));
+                }
+            }
+        }
+        Err(PresenterError::Gbm(format!(
+            "no target layout allocated for {width}x{height} {fourcc} ({}): {}{}",
+            config.describe(),
+            failures.join("; "),
+            self.backend_hint(),
+        )))
+    }
+
+    /// Re-announce the accepted formats after the chosen target layout changed.
+    ///
+    /// Android caches the announced layout, so a change replaces the generation
+    /// instead of waiting for the task to be recreated.
+    fn republish_formats(&mut self) -> Result<(), PresenterError> {
+        if self.endpoint.is_none() {
+            return Ok(());
+        }
+        let formats = self.published_formats()?;
+        let mut messages = Vec::with_capacity(self.tasks.len());
+        for (object, task) in &mut self.tasks {
+            task.feedback_generation = task.feedback_generation.saturating_add(1);
+            messages.push((*object, task.feedback_generation));
+        }
+        let Some(endpoint) = self.endpoint.as_mut() else {
+            return Ok(());
+        };
+        for (object, generation) in messages {
+            endpoint.send_format_feedback(object, generation, formats.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Republish once after the target layout changed.
+    fn republish_formats_if_stale(&mut self) -> Result<(), PresenterError> {
+        if !self.formats_stale.replace(false) {
+            return Ok(());
+        }
+        self.republish_formats()
+    }
+
+    /// Pick the target layout before Android is told what to allocate.
+    ///
+    /// Nothing accepts a 64x64 target, so this only exercises the allocation chain
+    /// and records what libgbm produced; a failed probe is not fatal because the
+    /// first real allocation retries the same chain and reports its own error.
+    fn probe_target_layout(&self) {
+        const PROBE_SIZE: u32 = 64;
+        // The probe target is never registered, so its identity cannot collide with
+        // a buffer Android learns about.
+        let probe = BufferId(0);
+        if let Err(error) = self.allocate_target(probe, PROBE_SIZE, PROBE_SIZE) {
+            eprintln!("Droidloom target probe failed: {error}");
+        }
+    }
+
+    /// One rung: ask gbm for the target and translate it for Android and `KWin`.
+    fn allocate_target_rung(
+        &self,
+        request: &TargetRequest<'_>,
+        attempt: &TargetAttempt,
+    ) -> Result<(RenderTarget, TargetLayout), PresenterError> {
+        let TargetRequest {
+            id,
+            width,
+            height,
+            fourcc,
+            advertised,
+        } = *request;
+        let allocation = match attempt.request {
+            AllocRequest::Unspecified(usage) => {
+                self.gbm
+                    .create_buffer_object::<()>(width, height, fourcc, usage)
+            }
+            AllocRequest::Modifier(modifier) => self
+                .gbm
+                .create_buffer_object_with_modifiers::<()>(
+                    width,
+                    height,
+                    fourcc,
+                    std::iter::once(modifier),
+                ),
+        }
+        .map_err(gbm_allocation_error)?;
         let plane_count = allocation.plane_count();
         if !(1..=4).contains(&plane_count) {
             return Err(PresenterError::Gbm(format!(
                 "GBM returned invalid plane count {plane_count}"
             )));
         }
-        let actual_modifier = u64::from(allocation.modifier());
-        let mut planes = Vec::with_capacity(plane_count as usize);
-        let mut plane_metadata = Vec::with_capacity(plane_count as usize);
-        for index in 0..plane_count {
-            let plane = i32::try_from(index)
-                .map_err(|_| PresenterError::Configuration("plane index overflow"))?;
-            planes.push(
-                allocation
-                    .fd_for_plane(plane)
-                    .map_err(|error| PresenterError::Gbm(error.to_string()))?,
-            );
-            plane_metadata.push(PlaneMetadata {
-                index,
-                offset: allocation.offset(plane),
-                stride: allocation.stride_for_plane(plane),
-            });
+        // The allocation's own layout is what Android must see, so a rung whose
+        // backfill Android cannot look up is not a candidate at all: gbm on
+        // radeonsi backfills MOD_INVALID for a modifier-less allocation, and
+        // Android's AHardwareBuffer path aborts the GPU server on that value.
+        let alloc_modifier = allocation.modifier();
+        if !android_accepts_modifier(alloc_modifier) {
+            return Err(PresenterError::Gbm(format!(
+                "backfilled {}: rejected, not in the host Vulkan list (Android would abort its GPU server)",
+                describe_modifier(alloc_modifier)
+            )));
         }
+        let compositor_modifier = compositor_modifier_for(attempt, alloc_modifier, advertised);
+        if compositor_modifier != alloc_modifier && !advertised.contains(&alloc_modifier) {
+            eprintln!(
+                "Droidloom target rung {} imported as {} while the buffer is {}",
+                attempt.rung,
+                describe_modifier(compositor_modifier),
+                describe_modifier(alloc_modifier)
+            );
+        }
+        let (planes, plane_metadata) = collect_planes(&allocation, plane_count)?;
         let metadata = BufferMetadata {
             id,
             width,
             height,
             format: FormatModifier {
                 fourcc: fourcc as u32,
-                modifier: actual_modifier,
+                modifier: u64::from(alloc_modifier),
             },
             planes: plane_metadata,
         };
+        let layout = TargetLayout {
+            rung: attempt.rung,
+            request: attempt.request,
+            alloc_modifier,
+            wire_modifier: compositor_modifier,
+            width,
+            height,
+            fourcc,
+            planes: plane_count,
+        };
         let wayland = None;
-        Ok(RenderTarget {
-            metadata,
-            planes,
-            wayland,
-            sync: None,
-            _allocation: Some(allocation),
-            host_owned: true,
-            retired: false,
-            busy: false,
-        })
+        Ok((
+            RenderTarget {
+                metadata,
+                compositor_modifier,
+                planes,
+                wayland,
+                sync: None,
+                _allocation: Some(allocation),
+                host_owned: true,
+                retired: false,
+                busy: false,
+            },
+            layout,
+        ))
     }
 
+    /// Name a `GBM_BACKEND` that cannot drive this node, instead of the drivers.
+    ///
+    /// Mesa picks its backend from the environment first, so a value such as `dri`
+    /// on an NVIDIA node makes every allocation fail with an unrelated errno.
+    fn backend_hint(&self) -> String {
+        let driver = render_node_driver(&self.render_node);
+        let backend = self.gbm.backend_name();
+        if driver == "nvidia" && backend != "nvidia" {
+            let value = env::var("GBM_BACKEND").unwrap_or_else(|_| "<unset>".to_owned());
+            return format!(
+                " (GBM_BACKEND={value} made libgbm use the {backend} backend on a {driver} node; unset it and retry)"
+            );
+        }
+        String::new()
+    }
+
+    /// Report the chosen layout once: which of the three parties each value serves
+    /// is the only way to diagnose a rejected buffer after the fact.
+    fn report_target_layout(&self, layout: &TargetLayout) {
+        if self.target_layout_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        eprintln!(
+            "Droidloom target layout: size={}x{} fourcc={} {} rung={} request={} {} planes={} render_node={} gbm_backend={}",
+            layout.width,
+            layout.height,
+            layout.fourcc,
+            self.target_config.describe(),
+            layout.rung,
+            describe_alloc_request(layout.request),
+            describe_target_modifiers(layout),
+            layout.planes,
+            self.render_node.display(),
+            self.gbm.backend_name(),
+        );
+    }
+
+    /// Import one target into the compositor.
+    ///
+    /// `compositor_modifier` is deliberately separate from
+    /// `metadata.format.modifier`: Android needs a layout it can look up, while
+    /// `KWin` accepts `MOD_INVALID` for a layout it did not advertise. The two
+    /// values describe the same buffer.
     fn create_wayland_buffer(
         &self,
         qh: &QueueHandle<Self>,
         metadata: &BufferMetadata,
         planes: &[OwnedFd],
+        compositor_modifier: Modifier,
     ) -> Result<wl_buffer::WlBuffer, PresenterError> {
         if planes.len() != metadata.planes.len() {
             return Err(PresenterError::Configuration(
@@ -1113,7 +1906,7 @@ impl App {
                 plane.index,
                 plane.offset,
                 plane.stride,
-                metadata.format.modifier,
+                u64::from(compositor_modifier),
             );
         }
         let width = i32::try_from(metadata.width)
@@ -1184,10 +1977,12 @@ impl App {
                 "duplicate local buffer identity",
             ));
         }
+        let compositor_modifier = Modifier::from(metadata.format.modifier);
         task.targets.insert(
             metadata.id,
             RenderTarget {
                 metadata,
+                compositor_modifier,
                 planes,
                 wayland,
                 sync: None,
@@ -1245,7 +2040,12 @@ impl App {
                 buffer: frame.buffer,
             })?;
         if target.wayland.is_none() {
-            let buffer = self.create_wayland_buffer(qh, &target.metadata, &target.planes)?;
+            let buffer = self.create_wayland_buffer(
+                qh,
+                &target.metadata,
+                &target.planes,
+                target.compositor_modifier,
+            )?;
             let timeline = WaylandTimeline::create(&self.syncobj)?;
             let descriptor = timeline.export_descriptor()?;
             let proxy = self
@@ -3222,6 +4022,11 @@ fn run() -> Result<(), PresenterError> {
     let render_node = env::var_os("DROIDLOOM_RENDER_NODE")
         .map_or_else(|| PathBuf::from("/dev/dri/renderD128"), PathBuf::from);
     validate_render_node(&render_node)?;
+    // Which (fourcc, modifier) pair host composition targets use, and how a
+    // finished frame would reach the compositor. Both are operator knobs: the
+    // layouts that satisfy libgbm, Android's importer and the compositor differ
+    // per driver stack.
+    let target_config = TargetConfig::from_environment()?;
     let identity = fs::metadata("/proc/self")?;
     prepare_socket_path(&socket_path, &runtime_root, identity.uid())?;
     // The async reactor may be created synchronously by Bridge::start.
@@ -3239,6 +4044,17 @@ fn run() -> Result<(), PresenterError> {
         .write(true)
         .open(&render_node)?;
     let gbm = GbmDevice::new(render_file.try_clone()?)?;
+    // One line that identifies the whole allocation environment: a stale
+    // GBM_BACKEND makes libgbm pick a backend that cannot allocate on this node,
+    // and the driver name next to it is what tells the two apart.
+    eprintln!(
+        "Droidloom presentation: render_node={} driver={} gbm_backend={} GBM_BACKEND={} {}",
+        render_node.display(),
+        render_node_driver(&render_node),
+        gbm.backend_name(),
+        env::var("GBM_BACKEND").unwrap_or_else(|_| "<unset>".to_owned()),
+        target_config.describe(),
+    );
     let syncobj = SyncobjDevice::from_file(render_file);
     let expected_peer = ExpectedPeer {
         pid: parse_env_u32("DROIDLOOM_HOST_PEER_PID", 0)?,
@@ -3292,6 +4108,7 @@ fn run() -> Result<(), PresenterError> {
             &qh,
         )?,
         clipboard_inputs: VecDeque::new(),
+        window_titles: load_window_titles(),
         text_input: text_input::TextInput::new(
             socket_path.with_file_name("text-input.sock"),
             globals.bind(&qh, 1..=1, ()).ok(),
@@ -3318,6 +4135,13 @@ fn run() -> Result<(), PresenterError> {
         sync_manager,
         syncobj,
         gbm,
+        target_config,
+        chosen_target: Cell::new(None),
+        target_attempt_log: Cell::new(None),
+        target_failure_log: Cell::new(None),
+        formats_stale: Cell::new(false),
+        render_node,
+        target_layout_logged: AtomicBool::new(false),
         listener,
         window_policy,
         densities: density::Densities::load(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME")),
@@ -3346,6 +4170,9 @@ fn run() -> Result<(), PresenterError> {
     while app.feedback.is_none() || app.host_canvas_size().is_none() {
         event_queue.blocking_dispatch(&mut app)?;
     }
+    // The compositor's format feedback is the last input the allocation chain
+    // needs, so the layout is chosen here rather than on the first frame.
+    app.probe_target_layout();
     notify_ready()?;
 
     run_presenter_loop(&conn, event_queue, app)
@@ -3370,6 +4197,7 @@ fn run_presenter_loop(
         app.apply_pending_resizes(&qh)?;
         app.accept_endpoint()?;
         app.drain_endpoint(&qh)?;
+        app.republish_formats_if_stale()?;
         app.refresh_frame_timelines(&qh)?;
         app.flush_timeline_frames(&qh)?;
         app.pump_direct_input()?;
@@ -3757,6 +4585,26 @@ fn parse_env_u32(name: &str, default: u32) -> Result<u32, PresenterError> {
     })
 }
 
+/// The DRM driver behind a render node, from sysfs (`nvidia`, `amdgpu`, ...).
+///
+/// libgbm silently picks a different backend when `GBM_BACKEND` names one that
+/// cannot drive the node, so the driver name next to `gbm.backend_name()` is what
+/// makes that failure obvious in a log.
+fn render_node_driver(path: &Path) -> String {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return "unknown".to_owned();
+    };
+    let uevent = Path::new("/sys/class/drm").join(name).join("device/uevent");
+    let Ok(contents) = fs::read_to_string(uevent) else {
+        return "unknown".to_owned();
+    };
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("DRIVER="))
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
 fn validate_render_node(path: &Path) -> Result<(), PresenterError> {
     let valid_name = path
         .file_name()
@@ -3895,6 +4743,132 @@ mod output_power_test;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_modifier_value_reads_as_hex_or_decimal() {
+        let preferred = Modifier::from(0x0300_0000_0060_6010);
+        assert_eq!(parse_modifier_value("0x0300000000606010"), Some(preferred));
+        assert_eq!(parse_modifier_value("0X0300000000606010"), Some(preferred));
+        assert_eq!(parse_modifier_value("0"), Some(Modifier::Linear));
+        assert_eq!(parse_modifier_value("0x"), None);
+        assert_eq!(parse_modifier_value("0xnothex"), None);
+        assert_eq!(parse_modifier_value(""), None);
+    }
+
+    #[test]
+    fn android_takes_linear_or_a_host_vulkan_layout_only() {
+        assert!(android_accepts_modifier(Modifier::Linear));
+        assert!(android_accepts_modifier(Modifier::from(0x0300_0000_0060_6015)));
+        // Compressed NVIDIA layouts and MOD_INVALID abort the GPU server.
+        assert!(!android_accepts_modifier(Modifier::from(0x0300_0000_00e0_8010)));
+        assert!(!android_accepts_modifier(Modifier::Invalid));
+        assert!(!android_accepts_modifier(Modifier::from(u64::MAX)));
+    }
+
+    #[test]
+    fn the_fallback_chain_tries_host_vulkan_layouts_before_linear() {
+        let low = Modifier::from(0x0300_0000_0060_6010);
+        let high = Modifier::from(0x0300_0000_0060_6012);
+        let compressed = Modifier::from(0x0300_0000_00e0_8010);
+        let chain = TargetPolicy::Auto.attempts(&[compressed, high, low, Modifier::Invalid]);
+        let requests = chain
+            .iter()
+            .map(|attempt| attempt.request)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests,
+            vec![
+                AllocRequest::Modifier(low),
+                AllocRequest::Modifier(high),
+                AllocRequest::Unspecified(BufferObjectFlags::RENDERING),
+                AllocRequest::Modifier(Modifier::Linear),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_advertised_linear_layout_leads_the_chain_exactly_once() {
+        let advertised = [Modifier::Linear, Modifier::from(0x0300_0000_0060_6010)];
+        let chain = TargetPolicy::Auto.attempts(&advertised);
+        assert_eq!(chain[0].rung, "linear-advertised");
+        assert_eq!(chain[0].request, AllocRequest::Modifier(Modifier::Linear));
+        assert_eq!(
+            chain
+                .iter()
+                .filter(|attempt| attempt.request == AllocRequest::Modifier(Modifier::Linear))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_wire_override_reaches_every_rung() {
+        let config = TargetConfig {
+            policy: TargetPolicy::Auto,
+            alloc: None,
+            wire: Some(WireModifierOverride::Invalid),
+        };
+        let chain = config.attempts(&[Modifier::from(0x0300_0000_0060_6010)]);
+        assert!(!chain.is_empty());
+        assert!(
+            chain
+                .iter()
+                .all(|attempt| attempt.wire == WireModifier::Fixed(Modifier::Invalid))
+        );
+    }
+
+    #[test]
+    fn a_host_vulkan_layout_outranks_a_compressed_one() {
+        let low = Modifier::from(0x0300_0000_0060_6010);
+        let high = Modifier::from(0x0300_0000_0060_6015);
+        let compressed = Modifier::from(0x0300_0000_00e0_8010);
+        assert!(candidate_rank(low) < candidate_rank(high));
+        assert!(candidate_rank(high) < candidate_rank(compressed));
+        // Neither is a candidate at all; they only have to sort behind the usable
+        // layouts so the log lists them last.
+        assert!(candidate_rank(high) < candidate_rank(Modifier::Invalid));
+    }
+
+    #[test]
+    fn the_compositor_imports_what_it_advertised_or_nothing_specific() {
+        let advertised = [Modifier::from(0x0300_0000_0060_6010)];
+        let rung = TargetAttempt::advertised(&advertised).remove(0);
+        assert_eq!(
+            compositor_modifier_for(&rung, advertised[0], &advertised),
+            advertised[0]
+        );
+        // An unadvertised layout is imported without a layout promise.
+        assert_eq!(
+            compositor_modifier_for(&rung, Modifier::Linear, &advertised),
+            Modifier::Invalid
+        );
+        let forced = TargetAttempt {
+            rung: "forced",
+            request: AllocRequest::Modifier(Modifier::Linear),
+            wire: WireModifier::Fixed(Modifier::Invalid),
+        };
+        assert_eq!(
+            compositor_modifier_for(&forced, Modifier::Linear, &advertised),
+            Modifier::Invalid
+        );
+    }
+
+    #[test]
+    fn modifiers_are_named_by_layout_than_by_gbm_enum() {
+        assert_eq!(describe_modifier(Modifier::Linear), "0x0000000000000000 (LINEAR)");
+        assert_eq!(
+            describe_modifier(Modifier::Invalid),
+            "0x00ffffffffffffff (MOD_INVALID)"
+        );
+        assert_eq!(
+            describe_modifier(Modifier::from(0x0300_0000_0060_6011)),
+            "0x0300000000606011 (NVIDIA_BLOCK_LINEAR_2D KIND=6 HEIGHT=1)"
+        );
+        assert_eq!(
+            describe_modifier(Modifier::from(0x0300_0000_00e0_8010)),
+            "0x0300000000e08010"
+        );
+    }
 
     #[test]
     fn an_output_scale_comes_from_its_logical_size() {
