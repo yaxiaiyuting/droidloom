@@ -831,10 +831,18 @@ impl App {
             (None, None, None, None)
         } else {
             let surface = self.compositor.create_surface(qh);
-            let window = self
-                .xdg_shell
-                .create_window(surface, WindowDecorations::None, qh);
-            window.set_title(package.to_owned());
+            // Server-side decorations give the toplevel a titlebar the compositor
+            // owns. Without one there is no draggable area at all: the whole
+            // surface belongs to the Android app, so the window cannot be moved.
+            let window =
+                self.xdg_shell
+                    .create_window(surface, WindowDecorations::RequestServer, qh);
+            let title = self
+                .window_titles
+                .get(package)
+                .cloned()
+                .unwrap_or_else(|| package.to_owned());
+            window.set_title(title);
             window.set_app_id(package.to_owned());
             window.set_min_size(Some((1, 1)));
             if let Some(manager) = &self.insets_manager {
