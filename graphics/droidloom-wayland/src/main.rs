@@ -21,6 +21,7 @@ mod resize;
 mod text_input;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::cell::Cell;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -58,7 +59,9 @@ use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Modifiers, RawModifiers, RepeatInfo,
 };
-use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{
+    AxisScroll, PointerEvent, PointerEventKind, PointerHandler,
+};
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
@@ -349,6 +352,114 @@ fn clear_contact_state(
     deferred.retain(|(_, event, _)| !matches!(event, InputEvent::Touch { .. }));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelMode {
+    /// Forward nothing, which is what this bridge did until now.
+    Off,
+    /// Turn each wheel notch into a short vertical drag at the cursor.
+    Touch,
+    /// Also turn touchpad and continuous scrolling into drags.
+    Touchpad,
+}
+
+impl WheelMode {
+    fn from_environment() -> Result<Self, PresenterError> {
+        const INVALID: PresenterError =
+            PresenterError::Configuration("DROIDLOOM_WHEEL must be off, touch or touchpad");
+        match env::var("DROIDLOOM_WHEEL") {
+            // On by default: a wheel that does nothing is the bug being fixed.
+            Err(env::VarError::NotPresent) => Ok(Self::Touch),
+            Ok(value) => match value.as_str() {
+                "off" => Ok(Self::Off),
+                "touch" => Ok(Self::Touch),
+                "touchpad" => Ok(Self::Touchpad),
+                _ => Err(INVALID),
+            },
+            Err(env::VarError::NotUnicode(_)) => Err(INVALID),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Touch => "touch",
+            Self::Touchpad => "touchpad",
+        }
+    }
+
+    /// Whether this frame is a kind of scrolling this mode synthesises.
+    ///
+    /// Compositors that send no `axis_source` only get the fine-grained fields to
+    /// go on; a bare `axis` sample could be a touchpad, so it is not enough.
+    fn accepts(self, frame: &WheelFrame) -> bool {
+        if self == Self::Off {
+            return false;
+        }
+        match frame.source {
+            Some(wl_pointer::AxisSource::Wheel) => true,
+            // Wheel tilt is a horizontal nudge, not a scroll.
+            Some(wl_pointer::AxisSource::WheelTilt) => false,
+            Some(_) => self == Self::Touchpad,
+            None => frame.value120 != 0 || frame.discrete != 0,
+        }
+    }
+}
+
+/// One frame of wheel input, merged from the several events one notch produces.
+///
+/// KWin sends `axis_source`, `axis_relative_direction`, `axis_value120` and `axis`
+/// for a single notch, and SCTK turns each into its own `PointerEventKind::Axis`
+/// carrying the same delta in a different field. Reading them one event at a time
+/// counted a notch twice, so the fields are summed here and read once per frame
+/// with `value120` outranking the coarser fields that repeat it.
+#[derive(Clone, Copy, Debug, Default)]
+struct WheelFrame {
+    source: Option<wl_pointer::AxisSource>,
+    inverted: bool,
+    time: u32,
+    value120: i32,
+    discrete: i32,
+    absolute: f64,
+}
+
+impl WheelFrame {
+    fn latch(&mut self, vertical: AxisScroll, time: u32, source: Option<wl_pointer::AxisSource>) {
+        if source.is_some() {
+            self.source = source;
+        }
+        if vertical.relative_direction == Some(wl_pointer::AxisRelativeDirection::Inverted) {
+            self.inverted = true;
+        }
+        // The axis-source event carries no usable time.
+        if time != 0 {
+            self.time = time;
+        }
+        self.value120 = self.value120.saturating_add(vertical.value120);
+        self.discrete = self.discrete.saturating_add(vertical.discrete);
+        self.absolute += vertical.absolute;
+    }
+
+    /// Wheel notches in this frame: the finest field wins, clamped to one flick.
+    fn notches(&self) -> i32 {
+        if self.value120 != 0 {
+            let notches = self.value120 / 120;
+            // A partial notch still has to move.
+            return if notches == 0 {
+                self.value120.signum()
+            } else {
+                notches.clamp(-8, 8)
+            };
+        }
+        if self.discrete != 0 {
+            return self.discrete.clamp(-8, 8);
+        }
+        if self.absolute.abs() >= 1.0 {
+            return if self.absolute > 0.0 { 1 } else { -1 };
+        }
+        0
+    }
+}
+
 struct App {
     activation: activation::Activation,
     layer_globals: layers::Globals,
@@ -380,6 +491,9 @@ struct App {
     /// The compositor's GPU and its own layouts Vulkan draws into, opened
     /// only when the compositor offers no linear buffers.
     gpu_targets: std::cell::OnceCell<Option<gpu_layouts::Targets>>,
+    /// The compositor's inverted-scroll setting has been reported.
+    wheel_inversion_logged: Cell<bool>,
+    wheel: WheelMode,
     listener: DenialEndpointListener,
     window_policy: WindowPolicyStore,
     /// The density each task gets on the output it is on.
@@ -831,9 +945,12 @@ impl App {
             (None, None, None, None)
         } else {
             let surface = self.compositor.create_surface(qh);
+            // Server-side decorations give the toplevel a titlebar the compositor
+            // owns. Without one there is no draggable area at all: the whole
+            // surface belongs to the Android app, so the window cannot be moved.
             let window = self
                 .xdg_shell
-                .create_window(surface, WindowDecorations::None, qh);
+                .create_window(surface, WindowDecorations::RequestServer, qh);
             window.set_title(package.to_owned());
             window.set_app_id(package.to_owned());
             window.set_min_size(Some((1, 1)));
@@ -2089,6 +2206,107 @@ impl App {
         Ok(self.motion_times.received(monotonic_timestamp_nanos()?))
     }
 
+    /// Scroll Android by turning a wheel notch into a short touch drag.
+    ///
+    /// The bridge carries touch and keys only, and Android's pinned injector always
+    /// builds a `AINPUT_SOURCE_TOUCHSCREEN` motion event, so a wheel cannot travel
+    /// as a wheel. Content follows the finger, which means scrolling down (a
+    /// positive axis value) drags towards the top of the window.
+    fn scroll_wheel(
+        &mut self,
+        object: TaskObjectId,
+        position: (f64, f64),
+        notches: i32,
+        millis: u32,
+    ) {
+        const STEPS: u32 = 8;
+        const STEP_NANOS: u64 = 4_000_000;
+        eprintln!(
+            "Droidloom scroll: notches={notches} drags=1 step={WHEEL_STEP_LOGICAL} steps={STEPS}"
+        );
+        let end = (position.0, position.1 - f64::from(notches) * WHEEL_STEP_LOGICAL);
+        let start = self.fixed_position(object, position);
+        let end = self.fixed_position(object, end);
+        if start == end {
+            // The cursor sits on an edge the drag would leave immediately.
+            return;
+        }
+        let contact = |position_fixed| Contact {
+            object,
+            // Mouse clicks use u32::MAX; the wheel keeps its own identity so the
+            // two never interleave in one Android pointer stream.
+            pointer_id: u32::MAX - 1,
+            position_fixed,
+        };
+        let now = match monotonic_timestamp_nanos() {
+            Ok(now) => now,
+            Err(error) => {
+                self.fail(&error);
+                return;
+            }
+        };
+        // A contact whose four events share one timestamp looks like an
+        // instantaneous tap to some Android views. Give the drag a real duration
+        // by stamping the samples across the last few milliseconds.
+        let base = now.saturating_sub(u64::from(STEPS) * STEP_NANOS);
+        let mut down = false;
+        let mut last_position = start;
+        for step in 0..=STEPS {
+            let action = if step == 0 {
+                TouchAction::Down
+            } else if step == STEPS {
+                TouchAction::Up
+            } else {
+                TouchAction::Motion
+            };
+            let ratio = f64::from(step) / f64::from(STEPS);
+            let position_fixed = (
+                start.0 + (f64::from(end.0 - start.0) * ratio) as i32,
+                start.1 + (f64::from(end.1 - start.1) * ratio) as i32,
+            );
+            let time = base + u64::from(step) * STEP_NANOS;
+            match self.send_input(object, contact(position_fixed).event(action), time) {
+                Err(error) => {
+                    if down {
+                        self.retire_wheel_contact(object, last_position, millis);
+                    }
+                    self.fail(&error);
+                    return;
+                }
+                Ok(true) => {
+                    down = action == TouchAction::Down || down;
+                    last_position = position_fixed;
+                }
+                Ok(false) => {
+                    if down {
+                        self.retire_wheel_contact(object, last_position, millis);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Drop a half-sent synthetic scroll so Android retires the contact.
+    ///
+    /// The cancel carries the last position the drag reached: a cancel at the
+    /// origin would contradict the contact's own history.
+    fn retire_wheel_contact(
+        &mut self,
+        object: TaskObjectId,
+        position_fixed: (i32, i32),
+        millis: u32,
+    ) {
+        let contact = Contact {
+            object,
+            pointer_id: u32::MAX - 1,
+            position_fixed,
+        };
+        if let Ok(time) = self.input_time(input_time::Device::Pointer, millis) {
+            let _ = self.send_input(object, contact.event(TouchAction::Cancel), time);
+        }
+    }
+
     /// Send one event stamped with its hardware time on the shared monotonic clock.
     fn send_input(
         &mut self,
@@ -3115,6 +3333,10 @@ impl PointerHandler for App {
         if self.pointer.as_ref() != Some(_pointer) {
             return;
         }
+        // One frame can carry several axis samples for one notch; merge them so a
+        // notch becomes one drag instead of one drag per field.
+        let mut wheel = WheelFrame::default();
+        let mut wheel_target: Option<(TaskObjectId, (f64, f64))> = None;
         for event in events {
             if let PointerEventKind::Press { serial, .. } = event.kind
                 && let Some(data) =
@@ -3175,6 +3397,19 @@ impl PointerHandler for App {
                         Ok(false) => {}
                     }
                 }
+                PointerEventKind::Axis {
+                    time,
+                    vertical,
+                    source,
+                    ..
+                } => {
+                    if self.wheel == WheelMode::Off {
+                        continue;
+                    }
+                    let Some(object) = object else { continue };
+                    wheel.latch(vertical, time, source);
+                    wheel_target = Some((object, event.position));
+                }
                 PointerEventKind::Release { button, time, .. } if button == LEFT_BUTTON => {
                     let Some(mut contact) = self.pointer_contact.take() else {
                         continue;
@@ -3197,6 +3432,20 @@ impl PointerHandler for App {
                     }
                 }
                 _ => {}
+            }
+        }
+        if let Some((object, position)) = wheel_target
+            && self.wheel.accepts(&wheel)
+            && self.pointer_contact.is_none()
+        {
+            let notches = wheel.notches();
+            if notches != 0 {
+                if wheel.inverted && !self.wheel_inversion_logged.replace(true) {
+                    eprintln!(
+                        "Droidloom scroll: the compositor reports inverted scrolling; the drag keeps the wheel's sign until that setting is measured"
+                    );
+                }
+                self.scroll_wheel(object, position, notches, wheel.time);
             }
         }
     }
@@ -3392,6 +3641,7 @@ fn run() -> Result<(), PresenterError> {
     let render_node = env::var_os("DROIDLOOM_RENDER_NODE")
         .map_or_else(|| PathBuf::from("/dev/dri/renderD128"), PathBuf::from);
     validate_render_node(&render_node)?;
+    let wheel = WheelMode::from_environment()?;
     let identity = fs::metadata("/proc/self")?;
     prepare_socket_path(&socket_path, &runtime_root, identity.uid())?;
     // The async reactor may be created synchronously by Bridge::start.
@@ -3500,6 +3750,8 @@ fn run() -> Result<(), PresenterError> {
         syncobj,
         gbm,
         gpu_targets: std::cell::OnceCell::new(),
+        wheel_inversion_logged: Cell::new(false),
+        wheel,
         listener,
         window_policy,
         densities: density::Densities::load(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME")),
@@ -3881,6 +4133,13 @@ fn fixed_16_16(value: f64) -> i32 {
     }
 }
 
+/// How far one wheel notch drags, in logical pixels.
+///
+/// Android's touch slop is a few dp, so a notch has to travel clearly further than
+/// that to become a scroll instead of a tap; 60 logical pixels is roughly one list
+/// row on every density.
+const WHEEL_STEP_LOGICAL: f64 = 30.0;
+
 fn scale_dimension(logical: u32, scale_120: u32) -> Result<u32, PresenterError> {
     if scale_120 == 0 {
         return Err(PresenterError::Configuration(
@@ -4080,6 +4339,78 @@ mod output_power_test;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn axis(absolute: f64, discrete: i32, value120: i32) -> AxisScroll {
+        AxisScroll {
+            absolute,
+            discrete,
+            value120,
+            relative_direction: None,
+            stop: false,
+        }
+    }
+
+    #[test]
+    fn one_notch_is_one_frame_however_many_events_it_arrives_in() {
+        let mut wheel = WheelFrame::default();
+        // What KWin sends for one notch: value120 and the same delta as axis.
+        wheel.latch(axis(0.0, 0, 0), 0, Some(wl_pointer::AxisSource::Wheel));
+        wheel.latch(axis(0.0, 0, 120), 5, None);
+        wheel.latch(axis(15.0, 0, 0), 5, None);
+        assert_eq!(wheel.notches(), 1);
+        assert_eq!(wheel.time, 5);
+        assert!(WheelMode::Touch.accepts(&wheel));
+    }
+
+    #[test]
+    fn wheel_notches_come_from_the_finest_axis_field() {
+        let frame = |absolute: f64, discrete: i32, value120: i32| WheelFrame {
+            value120,
+            discrete,
+            absolute,
+            ..WheelFrame::default()
+        };
+        assert_eq!(frame(0.0, 0, 120).notches(), 1);
+        assert_eq!(frame(0.0, 0, -120).notches(), -1);
+        // A partial notch still has to move.
+        assert_eq!(frame(0.0, 0, 60).notches(), 1);
+        assert_eq!(frame(0.0, 0, -60).notches(), -1);
+        assert_eq!(frame(0.0, -3, 0).notches(), -3);
+        assert_eq!(frame(12.0, 0, 0).notches(), 1);
+        assert_eq!(frame(-0.4, 0, 0).notches(), 0);
+        // One flick cannot travel further than the step clamp allows.
+        assert_eq!(frame(0.0, 0, 120 * 40).notches(), 8);
+    }
+
+    #[test]
+    fn only_wheel_sources_become_drags_unless_touchpad_is_asked_for() {
+        let wheel = |source| WheelFrame {
+            source,
+            value120: 120,
+            ..WheelFrame::default()
+        };
+        assert!(WheelMode::Touch.accepts(&wheel(Some(wl_pointer::AxisSource::Wheel))));
+        assert!(WheelMode::Touchpad.accepts(&wheel(Some(wl_pointer::AxisSource::Wheel))));
+        // A touchpad or a finger gesture is not a wheel notch.
+        assert!(!WheelMode::Touch.accepts(&wheel(Some(wl_pointer::AxisSource::Finger))));
+        assert!(WheelMode::Touchpad.accepts(&wheel(Some(wl_pointer::AxisSource::Finger))));
+        assert!(!WheelMode::Touch.accepts(&wheel(Some(wl_pointer::AxisSource::WheelTilt))));
+        assert!(!WheelMode::Off.accepts(&wheel(Some(wl_pointer::AxisSource::Wheel))));
+    }
+
+    #[test]
+    fn a_compositor_without_axis_source_still_needs_a_fine_grained_field() {
+        let bare = WheelFrame {
+            absolute: 15.0,
+            ..WheelFrame::default()
+        };
+        assert!(!WheelMode::Touch.accepts(&bare));
+        let titled = WheelFrame {
+            value120: 120,
+            ..WheelFrame::default()
+        };
+        assert!(WheelMode::Touch.accepts(&titled));
+    }
 
     #[test]
     fn an_output_scale_comes_from_its_logical_size() {
