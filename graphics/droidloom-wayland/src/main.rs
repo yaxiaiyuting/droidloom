@@ -439,6 +439,17 @@ impl WheelFrame {
         self.absolute += vertical.absolute;
     }
 
+    /// Continuous axis distance in this frame (touchpads), in notch units.
+    ///
+    /// `value120` and `discrete` are already whole notches, so they contribute
+    /// nothing here; only the continuous `absolute` field does.
+    fn continuous(&self) -> f64 {
+        if self.value120 != 0 || self.discrete != 0 {
+            return 0.0;
+        }
+        self.absolute
+    }
+
     /// Wheel notches in this frame: the finest field wins, clamped to one flick.
     fn notches(&self) -> i32 {
         if self.value120 != 0 {
@@ -494,6 +505,13 @@ struct App {
     /// The compositor's inverted-scroll setting has been reported.
     wheel_inversion_logged: Cell<bool>,
     wheel: WheelMode,
+    /// Touchpad axis remainder carried between frames.
+    ///
+    /// A two-finger scroll delivers fractions of a notch per frame (KWin sends
+    /// continuous axis values, often well below 1.0). Reading each frame on its
+    /// own drops every one of them, so a slow scroll moves nothing at all; the
+    /// remainder is carried here until it adds up to whole notches.
+    wheel_residual: f64,
     listener: DenialEndpointListener,
     window_policy: WindowPolicyStore,
     /// The density each task gets on the output it is on.
@@ -3438,7 +3456,26 @@ impl PointerHandler for App {
             && self.wheel.accepts(&wheel)
             && self.pointer_contact.is_none()
         {
-            let notches = wheel.notches();
+            // Continuous (touchpad) samples accumulate across frames; the whole
+            // notches they add up to are what actually moves the list.
+            let mut notches = wheel.notches();
+            let continuous = wheel.continuous();
+            if continuous != 0.0 {
+                // Direction change: drop the remainder instead of cancelling it
+                // out, otherwise reversing the fingers feels dead for a moment.
+                if continuous.signum() != self.wheel_residual.signum() {
+                    self.wheel_residual = 0.0;
+                }
+                self.wheel_residual += continuous;
+                while self.wheel_residual >= 1.0 {
+                    self.wheel_residual -= 1.0;
+                    notches += 1;
+                }
+                while self.wheel_residual <= -1.0 {
+                    self.wheel_residual += 1.0;
+                    notches -= 1;
+                }
+            }
             if notches != 0 {
                 if wheel.inverted && !self.wheel_inversion_logged.replace(true) {
                     eprintln!(
@@ -3752,6 +3789,7 @@ fn run() -> Result<(), PresenterError> {
         gpu_targets: std::cell::OnceCell::new(),
         wheel_inversion_logged: Cell::new(false),
         wheel,
+        wheel_residual: 0.0,
         listener,
         window_policy,
         densities: density::Densities::load(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME")),
